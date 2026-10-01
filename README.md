@@ -13,6 +13,40 @@ npm run lint && npm run typecheck && npm run build
 
 `?seed=1234` fixes the world. `?debug` (or the <kbd>`</kbd> key) shows the developer overlay.
 
+## What it looks like
+
+All screenshots come from one real run (`?seed=4242`). Every number in them was measured by the simulation at that moment.
+
+![One world](docs/images/01-one-world.jpg)
+*Figure 1. One world. Grazers in six coloured lineages school across a glowing resource landscape. Amber hunters, shaped like rings, chase them. When something dies it leaves a luminous remnant, and the remnants link into faint constellations.*
+
+![Moving one organism](docs/images/02-touch.jpg)
+*Figure 2. Change one thing. Time stops and the camera leans in. Dragging moves the organism only 0.70 px, the gap between the faint ring (where it was) and the bright ring (where it is now).*
+
+![Two futures diverging](docs/images/03-two-worlds.jpg)
+*Figure 3. Two futures. World A is untouched and World B carries the 0.70 px change. Seven seconds later they are already 15.2% different. The faint halos mark the organisms that are no longer where their twin is, and you can watch them spread outward from the touched one.*
+
+![The first difference](docs/images/04-first-difference.jpg)
+*Figure 4. The first difference. Both worlds are replayed from the moment of the touch, and the replay stops at the first event that happened differently. Here two organisms touched 1128 ms earlier in World B, 1.93 s after the change. Everything after that followed from it.*
+
+![Sixteen futures](docs/images/05-sixteen.jpg)
+*Figure 5. Sixteen futures. Every world splits again with its own tiny ±δ change. The thin luminous lines are the family tree, drawn as an H-tree: siblings sit side by side, and each pair of siblings joins its cousins one level up.*
+
+![1,024 futures](docs/images/06-many.jpg)
+*Figure 6. 1,024 futures, all descended from the same 0.70 px touch and all simulated live. The panel on the right counts what has become of them so far. In this run, 595 have been taken over by a single lineage, 400 are stable and 29 are still diverse.*
+
+![Following one family line](docs/images/07-family-path.jpg)
+*Figure 7. How the worlds are related. Hovering over a world lights its ancestry in gold, from the world itself back to the origin. Each fork is labelled with the tiny change made there, e.g. "B2·1 · turned +0.14°" or "B2 · energy −0.34%". The card gives the hovered world's own state: population, lineages, food, births and deaths.*
+
+![Futures sorted by outcome](docs/images/08-outcomes.jpg)
+*Figure 8. Arrange by outcome. The same 1,024 futures, regrouped by what became of them: 659 taken by one lineage, 337 stable, 20 diverse and 8 whose hunters all died. Each world's rim is tinted with its class colour. All of these worlds were identical a couple of minutes earlier.*
+
+![Folding back to the origin](docs/images/09-collapse.jpg)
+*Figure 9. Return to the beginning. The futures fold back into their parents along the tree, from 1,024 to 512 to 256, all the way down to 1.*
+
+![All of that came from this](docs/images/10-origin.jpg)
+*Figure 10. The ending. The original world reappears at the instant it was touched, with the organism shown in both of its positions: where it was, and 0.70 px away.*
+
 ## The experience
 
 1. **One world.** A disk-shaped ecosystem, already alive.
