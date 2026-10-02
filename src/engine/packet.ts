@@ -1,198 +1,260 @@
 import {
   EVENT_RING,
-  FIELD_N,
-  KIND_HUNTER,
-  MAX_REMNANTS,
   METRIC_COUNT,
+  M_PAIR_DIFF,
+  M_PAIR_DIV,
+  M_PAIR_EVER,
+  M_PAIR_GEN,
+  M_PAIR_ON,
+  N_NEURONS,
   computeMetrics,
+  divergenceOf,
   encodeMetrics,
-  type World,
+  networkFor,
+  type CausalTrace,
+  type Mind,
+  type Network,
 } from '../sim';
 
 /**
  * Render packets: what a simulation worker sends the main thread each frame.
  *
  * One ArrayBuffer per worker per frame, read through Float32 / Uint32 views.
- * Everything is 4-byte words. Per world:
+ * Everything is 4-byte words. Per mind:
  *
- *   header   HEADER_WORDS  key, lod, nAgents, nRemnants, fieldRes, nEvents, blockWords, step
+ *   header   HEADER_WORDS  key, lod, nUnits, fieldRes, nEvents, blockWords, step, flags
  *   metrics  METRIC_COUNT
- *   agents   nAgents × AGENT_STRIDE   x y vx vy energy hue code flash
- *   ids      nAgents                  (LOD ≥ 2)
- *   remnants nRemnants × REMNANT_STRIDE  x y strength hue linkX linkY
- *   events   nEvents × EVENT_STRIDE      type x y lineage
- *   field    fieldRes² × 2 bytes (resource, fertility), padded to words
+ *   units    nUnits × UNIT_STRIDE   potential, activation, since, pink, cause   (LOD_HIGH)
+ *   events   nEvents × EVENT_STRIDE type, step, a
+ *   field    fieldRes² × 2 bytes (activity, pink), padded to words
  *
- * Agent `code` = kind + 2·lineage; the renderer adds 16·tileIndex. `flash` is
- * 0→1 over an organism's first two seconds of life (grazers) or the share of
- * its rest remaining after a catch (hunters).
+ * `since` is milliseconds since the unit last fired (capped), or, while a
+ * postponed spike is being held back, minus the milliseconds until it is
+ * released. `pink` is the unit's causal lineage (0 unless the mind is being
+ * compared with a control twin); `cause` is the presynaptic unit its change
+ * was traced to (−1 none).
  */
 
 export const HEADER_WORDS = 8;
-export const AGENT_STRIDE = 8;
-export const REMNANT_STRIDE = 6;
-export const EVENT_STRIDE = 4;
+export const UNIT_STRIDE = 5;
+export const EVENT_STRIDE = 3;
 export const PACKET_HEADER = 4;
+export const SINCE_CAP = 999;
 
-/** Level of detail requested for a world. */
+export const FLAG_PAIRED = 1;
+
+/** Level of detail requested for a mind. */
 export const LOD_NONE = 0; // metrics only (off-screen)
-export const LOD_LOW = 1; // agents + 16² field
-export const LOD_HIGH = 2; // + ids, remnants, 48² field
+export const LOD_LOW = 1; // + 16² activity field
+export const LOD_HIGH = 2; // + every unit, events, 48² field
 
 export const LOW_FIELD = 16;
+export const HIGH_FIELD = 48;
 
 function fieldResFor(lod: number): number {
-  return lod >= LOD_HIGH ? FIELD_N : lod >= LOD_LOW ? LOW_FIELD : 0;
+  return lod >= LOD_HIGH ? HIGH_FIELD : lod >= LOD_LOW ? LOW_FIELD : 0;
 }
 
-export function blockWordsFor(w: World, lod: number, nEvents: number): number {
-  const n = lod >= LOD_LOW ? w.n : 0;
-  let words = HEADER_WORDS + METRIC_COUNT + n * AGENT_STRIDE;
-  if (lod >= LOD_HIGH) words += n + MAX_REMNANTS * REMNANT_STRIDE;
+export function blockWordsFor(lod: number, nEvents: number): number {
+  let words = HEADER_WORDS + METRIC_COUNT;
+  if (lod >= LOD_HIGH) words += N_NEURONS * UNIT_STRIDE;
   words += nEvents * EVENT_STRIDE;
   const fr = fieldResFor(lod);
   words += Math.ceil((fr * fr * 2) / 4);
   return words;
 }
 
-export function newEventCount(w: World, lastTotal: number, lod: number): number {
+export function newEventCount(m: Mind, lastTotal: number, lod: number): number {
   if (lod < LOD_LOW) return 0;
-  return Math.min(EVENT_RING, Math.max(0, w.evTotal - lastTotal));
+  return Math.min(EVENT_RING, Math.max(0, m.evTotal - lastTotal));
 }
 
-/** Writes one world block at word offset `o`; returns the next offset. */
-export function writeWorldBlock(
-  w: World,
+// ---- activity field ----------------------------------------------------------------
+
+interface Splat {
+  idx: Int32Array; // 4 per unit
+  w: Float32Array; // 4 per unit
+}
+const splats = new Map<string, Splat>();
+
+function splatFor(net: Network, res: number): Splat {
+  const key = `${net.seed}:${res}`;
+  let s = splats.get(key);
+  if (s) return s;
+  if (splats.size > 8) splats.clear();
+  const n = net.n;
+  s = { idx: new Int32Array(n * 4), w: new Float32Array(n * 4) };
+  for (let i = 0; i < n; i++) {
+    const fx = ((net.x[i] + 1) / 2) * res - 0.5;
+    const fy = ((net.y[i] + 1) / 2) * res - 0.5;
+    const ix = Math.max(0, Math.min(res - 2, Math.floor(fx)));
+    const iy = Math.max(0, Math.min(res - 2, Math.floor(fy)));
+    const tx = Math.min(1, Math.max(0, fx - ix));
+    const ty = Math.min(1, Math.max(0, fy - iy));
+    const c = iy * res + ix;
+    s.idx.set([c, c + 1, c + res, c + res + 1], i * 4);
+    s.w.set([(1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty], i * 4);
+  }
+  splats.set(key, s);
+  return s;
+}
+
+let fieldA = new Float32Array(HIGH_FIELD * HIGH_FIELD);
+let fieldP = new Float32Array(HIGH_FIELD * HIGH_FIELD);
+let tmp = new Float32Array(HIGH_FIELD * HIGH_FIELD);
+
+function blur(f: Float32Array, res: number): void {
+  if (tmp.length < f.length) tmp = new Float32Array(f.length);
+  for (let j = 0; j < res; j++) {
+    const r = j * res;
+    for (let i = 0; i < res; i++) {
+      const l = i > 0 ? f[r + i - 1] : f[r + i];
+      const h = i < res - 1 ? f[r + i + 1] : f[r + i];
+      tmp[r + i] = 0.25 * l + 0.5 * f[r + i] + 0.25 * h;
+    }
+  }
+  for (let j = 0; j < res; j++) {
+    for (let i = 0; i < res; i++) {
+      const c = j * res + i;
+      const l = j > 0 ? tmp[c - res] : tmp[c];
+      const h = j < res - 1 ? tmp[c + res] : tmp[c];
+      f[c] = 0.25 * l + 0.5 * tmp[c] + 0.25 * h;
+    }
+  }
+}
+
+function writeField(m: Mind, net: Network, res: number, trace: CausalTrace | null, u8: Uint8Array, byteOffset: number): void {
+  const cells = res * res;
+  if (fieldA.length < cells) {
+    fieldA = new Float32Array(cells);
+    fieldP = new Float32Array(cells);
+  }
+  fieldA.fill(0, 0, cells);
+  fieldP.fill(0, 0, cells);
+  const sp = splatFor(net, res);
+  const n = N_NEURONS;
+  const t = m.step;
+  for (let i = 0; i < n; i++) {
+    // Activation, plus a flash for units that have just fired.
+    const since = t - 1 - m.lastSpike[i];
+    const a = m.trace[i] * 0.35 + (since < 12 ? (12 - since) / 12 : 0);
+    const p = trace ? trace.pink(i) : 0;
+    for (let k = 0; k < 4; k++) {
+      const c = sp.idx[i * 4 + k];
+      const w = sp.w[i * 4 + k];
+      fieldA[c] += a * w;
+      if (p > 0) fieldP[c] += p * w;
+    }
+  }
+  const fa = fieldA.subarray(0, cells);
+  const fp = fieldP.subarray(0, cells);
+  blur(fa, res);
+  blur(fp, res);
+  if (res > LOW_FIELD) {
+    blur(fa, res);
+    blur(fp, res);
+  }
+  // Fewer cells collect more units each: scale so both resolutions read alike.
+  const ka = (res * res) / (HIGH_FIELD * HIGH_FIELD) * 2.2;
+  const kp = (res * res) / (HIGH_FIELD * HIGH_FIELD) * 3.5;
+  for (let c = 0; c < cells; c++) {
+    const a = fa[c] / ka;
+    const p = fp[c] / kp;
+    u8[byteOffset + c * 2] = a <= 0 ? 0 : a >= 1 ? 255 : (a * 255 + 0.5) | 0;
+    u8[byteOffset + c * 2 + 1] = p <= 0 ? 0 : p >= 1 ? 255 : (p * 255 + 0.5) | 0;
+  }
+}
+
+/** Optional comparison with a control twin, for minds being watched in pairs. */
+export interface PairInfo {
+  control: Mind;
+  trace: CausalTrace;
+}
+
+/** Writes one mind block at word offset `o`; returns the next offset. */
+export function writeMindBlock(
+  m: Mind,
   key: number,
   lod: number,
   lastEvTotal: number,
+  pair: PairInfo | null,
   f32: Float32Array,
   u32: Uint32Array,
   u8: Uint8Array,
   o: number,
 ): number {
-  const nEvents = newEventCount(w, lastEvTotal, lod);
-  const words = blockWordsFor(w, lod, nEvents);
-  const n = lod >= LOD_LOW ? w.n : 0;
+  const nEvents = newEventCount(m, lastEvTotal, lod);
+  const words = blockWordsFor(lod, nEvents);
   const fr = fieldResFor(lod);
-  let nRem = 0;
+  const n = lod >= LOD_HIGH ? N_NEURONS : 0;
+  const net = networkFor(m.seed);
 
   let p = o + HEADER_WORDS;
-  encodeMetrics(w, computeMetrics(w), f32, p);
+  encodeMetrics(computeMetrics(m), f32, p);
+  if (pair) {
+    const d = divergenceOf(m.trace, pair.control.trace, m.v, pair.control.v, m.rate, pair.control.rate);
+    f32[p + M_PAIR_DIV] = d.score;
+    f32[p + M_PAIR_DIFF] = pair.trace.differing;
+    f32[p + M_PAIR_EVER] = pair.trace.mismatched;
+    f32[p + M_PAIR_GEN] = pair.trace.maxGen;
+    f32[p + M_PAIR_ON] = 1;
+  }
   p += METRIC_COUNT;
 
-  const s = w.step;
+  const t = m.step;
   for (let i = 0; i < n; i++) {
-    const k = p + i * AGENT_STRIDE;
-    f32[k] = w.x[i];
-    f32[k + 1] = w.y[i];
-    f32[k + 2] = w.vx[i];
-    f32[k + 3] = w.vy[i];
-    f32[k + 4] = w.e[i];
-    f32[k + 5] = w.gHue[i];
-    const hunter = w.kind[i] === KIND_HUNTER;
-    f32[k + 6] = w.kind[i] + 2 * w.lin[i];
-    if (hunter) f32[k + 7] = w.cool[i] / 300;
-    else f32[k + 7] = w.born[i] < 0 ? 1 : Math.min(1, (s - w.born[i]) / 120);
-  }
-  p += n * AGENT_STRIDE;
-
-  if (lod >= LOD_HIGH) {
-    for (let i = 0; i < n; i++) u32[p + i] = w.id[i];
-    p += n;
-    const remStart = p;
-    for (let k = 0; k < MAX_REMNANTS; k++) {
-      if (!w.rAlive[k]) continue;
-      const q = remStart + nRem * REMNANT_STRIDE;
-      f32[q] = w.rx[k];
-      f32[q + 1] = w.ry[k];
-      f32[q + 2] = w.rs[k];
-      f32[q + 3] = w.rHue[k];
-      const l = w.rLink[k];
-      if (l >= 0 && w.rAlive[l] && w.rId[l] === w.rLinkId[k]) {
-        f32[q + 4] = w.rx[l];
-        f32[q + 5] = w.ry[l];
-      } else {
-        f32[q + 4] = NaN;
-        f32[q + 5] = NaN;
-      }
-      nRem++;
+    const k = p + i * UNIT_STRIDE;
+    f32[k] = m.v[i];
+    f32[k + 1] = m.trace[i];
+    const hu = m.holdUntil[i];
+    if (hu >= t) f32[k + 2] = -(hu - t + 1);
+    else {
+      const since = t - 1 - m.lastSpike[i];
+      f32[k + 2] = since > SINCE_CAP ? SINCE_CAP : since;
     }
-    p += MAX_REMNANTS * REMNANT_STRIDE;
+    f32[k + 3] = pair ? pair.trace.pink(i) : 0;
+    f32[k + 4] = pair ? pair.trace.cause[i] : -1;
   }
+  p += n * UNIT_STRIDE;
 
   for (let k = 0; k < nEvents; k++) {
-    const h = (w.evHead - nEvents + k + EVENT_RING) % EVENT_RING;
+    const h = (m.evHead - nEvents + k + EVENT_RING) % EVENT_RING;
     const q = p + k * EVENT_STRIDE;
-    f32[q] = w.evType[h];
-    f32[q + 1] = w.evX[h];
-    f32[q + 2] = w.evY[h];
-    f32[q + 3] = w.evLin[h];
+    f32[q] = m.evType[h];
+    f32[q + 1] = m.evStep[h];
+    f32[q + 2] = m.evA[h];
   }
   p += nEvents * EVENT_STRIDE;
 
-  if (fr > 0) {
-    const b = p * 4;
-    if (fr === FIELD_N) {
-      for (let c = 0; c < FIELD_N * FIELD_N; c++) {
-        const r = w.res[c];
-        const fe = w.fert[c];
-        u8[b + c * 2] = r <= 0 ? 0 : r >= 1 ? 255 : (r * 255 + 0.5) | 0;
-        u8[b + c * 2 + 1] = fe <= 0 ? 0 : fe >= 2.5 ? 255 : ((fe / 2.5) * 255 + 0.5) | 0;
-      }
-    } else {
-      const k = FIELD_N / fr;
-      const inv = 1 / (k * k);
-      for (let j = 0; j < fr; j++) {
-        for (let i = 0; i < fr; i++) {
-          let r = 0;
-          let fe = 0;
-          for (let dj = 0; dj < k; dj++) {
-            const row = (j * k + dj) * FIELD_N + i * k;
-            for (let di = 0; di < k; di++) {
-              r += w.res[row + di];
-              fe += w.fert[row + di];
-            }
-          }
-          r *= inv;
-          fe *= inv;
-          const c = j * fr + i;
-          u8[b + c * 2] = r >= 1 ? 255 : (r * 255 + 0.5) | 0;
-          u8[b + c * 2 + 1] = fe >= 2.5 ? 255 : ((fe / 2.5) * 255 + 0.5) | 0;
-        }
-      }
-    }
-  }
+  if (fr > 0) writeField(m, net, fr, pair ? pair.trace : null, u8, p * 4);
 
   u32[o] = key;
   u32[o + 1] = lod;
   u32[o + 2] = n;
-  u32[o + 3] = nRem;
-  u32[o + 4] = fr;
-  u32[o + 5] = nEvents;
-  u32[o + 6] = words;
-  u32[o + 7] = s;
+  u32[o + 3] = fr;
+  u32[o + 4] = nEvents;
+  u32[o + 5] = words;
+  u32[o + 6] = t;
+  u32[o + 7] = pair ? FLAG_PAIRED : 0;
   return o + words;
 }
 
-/** A decoded view of one world in a packet. All arrays are views into the packet buffer. */
-export interface WorldFrame {
+/** A decoded view of one mind in a packet. All arrays are views into the packet buffer. */
+export interface MindFrame {
   key: number;
   lod: number;
   step: number;
   n: number;
+  paired: boolean;
   metrics: Float32Array;
-  agents: Float32Array;
-  ids: Uint32Array | null;
-  nRemnants: number;
-  remnants: Float32Array | null;
+  units: Float32Array;
   nEvents: number;
   events: Float32Array;
   fieldRes: number;
   field: Uint8Array | null;
 }
 
-export function decodePacket(buf: ArrayBuffer, out: WorldFrame[]): number {
+export function decodePacket(buf: ArrayBuffer, out: MindFrame[]): number {
   const u32 = new Uint32Array(buf);
   const f32 = new Float32Array(buf);
   const count = u32[1];
@@ -202,36 +264,25 @@ export function decodePacket(buf: ArrayBuffer, out: WorldFrame[]): number {
     const key = u32[o];
     const lod = u32[o + 1];
     const n = u32[o + 2];
-    const nRem = u32[o + 3];
-    const fr = u32[o + 4];
-    const nEv = u32[o + 5];
-    const words = u32[o + 6];
+    const fr = u32[o + 3];
+    const nEv = u32[o + 4];
+    const words = u32[o + 5];
     let p = o + HEADER_WORDS;
     const metrics = f32.subarray(p, p + METRIC_COUNT);
     p += METRIC_COUNT;
-    const agents = f32.subarray(p, p + n * AGENT_STRIDE);
-    p += n * AGENT_STRIDE;
-    let ids: Uint32Array | null = null;
-    let remnants: Float32Array | null = null;
-    if (lod >= LOD_HIGH) {
-      ids = u32.subarray(p, p + n);
-      p += n;
-      remnants = f32.subarray(p, p + nRem * REMNANT_STRIDE);
-      p += MAX_REMNANTS * REMNANT_STRIDE;
-    }
+    const units = f32.subarray(p, p + n * UNIT_STRIDE);
+    p += n * UNIT_STRIDE;
     const events = f32.subarray(p, p + nEv * EVENT_STRIDE);
     p += nEv * EVENT_STRIDE;
     const field = fr > 0 ? new Uint8Array(buf, p * 4, fr * fr * 2) : null;
     out.push({
       key,
       lod,
-      step: u32[o + 7],
+      step: u32[o + 6],
       n,
+      paired: (u32[o + 7] & FLAG_PAIRED) !== 0,
       metrics,
-      agents,
-      ids,
-      nRemnants: nRem,
-      remnants,
+      units,
       nEvents: nEv,
       events,
       fieldRes: fr,

@@ -2,12 +2,15 @@ import type { Intervention } from '../sim';
 import type { PathEntry } from '../sim/replay';
 
 /**
- * The family tree of futures. Nodes are keyed by heap index: the origin is 1,
+ * The family tree of minds. Nodes are keyed by heap index: the origin is 1,
  * the children of k are 2k and 2k+1. Every node is fully described by its
- * ancestors' (step, intervention) pairs; no node stores a world.
+ * ancestors' (step, intervention) pairs; no node stores a mind.
  *
- * Depth 1 is the visitor's choice: A = 2 (untouched), B = 3 (touched).
- * Deeper splits are the machine's: child 2k receives +δ, child 2k+1 −δ.
+ * Depth 1 is the visitor's choice: 2 = ORIGINAL (unchanged), 3 = ALTERED.
+ * Deeper forks are the machine's: child 2k continues unchanged and child
+ * 2k+1 receives one new microscopic change. So the leftmost leaf is always
+ * the untouched original, and every mind differs from its twin by exactly one
+ * thing.
  */
 export interface BranchNode {
   key: number;
@@ -72,6 +75,13 @@ export class BranchTree {
     return chain.map((n) => ({ step: n.step, iv: n.iv }));
   }
 
+  /** How many microscopic changes separate this mind from the untouched original. */
+  changes(key: number): number {
+    let c = 0;
+    for (let k = key; k > 1; k = parentOf(k)) if (this.nodes.get(k)?.iv) c++;
+    return c;
+  }
+
   lca(a: number, b: number): number {
     while (depthOf(a) > depthOf(b)) a = parentOf(a);
     while (depthOf(b) > depthOf(a)) b = parentOf(b);
@@ -82,7 +92,7 @@ export class BranchTree {
     return a;
   }
 
-  /** WORLD 0, A, B, A1, A2, B1·2, … */
+  /** MIND 0, A, B, A1, A2, B1·2, … */
   static label(key: number): string {
     if (key === 1) return '0';
     const d = depthOf(key);

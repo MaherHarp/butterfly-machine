@@ -44,6 +44,11 @@ export class Overlay {
   private cardEl: HTMLElement;
   private debugEl: HTMLElement;
   private live: HTMLElement;
+  private timingEl: HTMLElement;
+  private timingInput: HTMLInputElement;
+  private timingValue: HTMLElement;
+  private timingHandler: ((v: number) => void) | null = null;
+  private timingCommit: (() => void) | null = null;
   private labelEls = new Map<string, HTMLElement>();
   private markerEls = new Map<string, HTMLElement>();
   private actionKey = '';
@@ -60,6 +65,8 @@ export class Overlay {
     h1.textContent = 'The Butterfly Machine';
     const p = el('p', '', this.title);
     p.innerHTML = 'One tiny choice.<br />Hundreds of different worlds.';
+    const sub = el('div', 'sub', this.title);
+    sub.textContent = 'A neuro-inspired artwork';
 
     this.caption = el('div', 'layer caption', root);
     this.capBig = el('div', 'big hidden', this.caption);
@@ -72,6 +79,28 @@ export class Overlay {
     this.summaryEl = el('div', 'layer summary hidden', root);
     this.cardEl = el('div', 'layer card hidden', root);
     this.debugEl = el('div', 'layer debug hidden', root);
+
+    this.timingEl = el('div', 'layer timing hidden', root);
+    const lab = el('label', 'tl', this.timingEl);
+    lab.textContent = 'delay';
+    this.timingInput = el('input', '', this.timingEl);
+    this.timingInput.type = 'range';
+    this.timingInput.min = '1';
+    this.timingInput.max = '10';
+    this.timingInput.step = '1';
+    this.timingInput.setAttribute('aria-label', 'Delay this spike, in milliseconds');
+    this.timingValue = el('span', 'tv', this.timingEl);
+    this.timingInput.addEventListener('input', () => {
+      const v = Number(this.timingInput.value);
+      this.timingValue.textContent = `${v} ms`;
+      this.timingHandler?.(v);
+    });
+    this.timingInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        this.timingCommit?.();
+      }
+    });
 
     this.controls = el('div', 'layer controls', root);
     this.saveBtn = el('button', 'btn', this.controls);
@@ -118,6 +147,10 @@ export class Overlay {
       this.announce(this.capLine.textContent ?? '');
     }
     this.capLine.classList.toggle('hidden', !html);
+  }
+
+  captionHigh(high: boolean): void {
+    this.caption.classList.toggle('high', high);
   }
 
   captionLow(low: boolean): void {
@@ -210,6 +243,27 @@ export class Overlay {
     const py = Math.min(vh - h - 8, Math.max(8, y - h / 2));
     this.cardEl.style.transform = `translate(${px}px, ${py}px)`;
     this.cardEl.classList.remove('hidden');
+  }
+
+  /**
+   * The one control of the artwork: a tiny timing slider (1–10 ms) beneath
+   * the spike being changed. Pass null to hide it.
+   */
+  timing(spec: { x: number; y: number; value: number } | null, onInput?: (v: number) => void, onCommit?: () => void): void {
+    if (!spec) {
+      this.timingEl.classList.add('hidden');
+      this.timingHandler = null;
+      this.timingCommit = null;
+      return;
+    }
+    if (onInput) this.timingHandler = onInput;
+    if (onCommit) this.timingCommit = onCommit;
+    if (Number(this.timingInput.value) !== spec.value) this.timingInput.value = String(spec.value);
+    this.timingValue.textContent = `${spec.value} ms`;
+    this.timingEl.style.transform = `translate(${spec.x.toFixed(1)}px, ${spec.y.toFixed(1)}px) translate(-50%, 0)`;
+    const wasHidden = this.timingEl.classList.contains('hidden');
+    this.timingEl.classList.remove('hidden');
+    if (wasHidden) setTimeout(() => this.timingInput.focus({ preventScroll: true }), 60);
   }
 
   debug(text: string | null): void {

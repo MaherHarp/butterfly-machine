@@ -1,12 +1,14 @@
 import { depthOf } from '../engine/tree';
 
+import { N_ASSEMBLIES } from '../sim/constants';
+
 /**
- * Where futures live on the plane.
+ * Where minds live on the plane.
  *
  * The family tree is drawn as an H-tree: each split pushes two children apart
  * along alternating axes, so siblings are neighbours, cousins form 2×2
- * blocks, and at 1,024 futures the leaves tile a 32×32 square. Hierarchy is
- * readable as space: zoom out and nearby futures are close relatives.
+ * blocks, and at 1,024 minds the leaves tile a 32×32 square. Hierarchy is
+ * readable as space: zoom out and nearby minds are close relatives.
  */
 export const LEAF_SPACING = 2.36;
 
@@ -39,6 +41,53 @@ export function treeBounds(depth: number): { minX: number; maxX: number; minY: n
     else maxY += o;
   }
   return { minX: -maxX - 1.15, maxX: maxX + 1.15, minY: -maxY - 1.15, maxY: maxY + 1.15 };
+}
+
+// ---------------------------------------------------------------------------
+// The landscape of interpretations
+// ---------------------------------------------------------------------------
+
+/**
+ * Where each attractor sits on the landscape (unit circle, y down). They are
+ * arranged so that neighbours share a fragment of the stimulus:
+ * home–nostalgia (house), nostalgia–distance (rain), distance–loss (rain),
+ * loss–fear (figure), fear–safety (figure), safety–home (doorway).
+ * UNKNOWN, the undecided state, is the centre.
+ */
+const ANCHOR_ORDER = [0, 4, 5, 1, 2, 3]; // home, nostalgia, distance, loss, fear, safety (clockwise from the top)
+export const ANCHORS: Array<[number, number]> = (() => {
+  const out: Array<[number, number]> = new Array(N_ASSEMBLIES);
+  ANCHOR_ORDER.forEach((k, i) => {
+    const a = -Math.PI / 2 + (i * 2 * Math.PI) / N_ASSEMBLIES;
+    out[k] = [Math.cos(a), Math.sin(a)];
+  });
+  return out;
+})();
+
+/**
+ * Projects a mind's state onto the landscape: a RadViz-style projection of
+ * its six assembly rates (each assembly pulls toward its anchor in
+ * proportion to its share of activity), drawn outward to the dominant
+ * anchor as the mind commits to it. Undecided minds sit near the centre.
+ */
+export function landscapeTarget(rates: ArrayLike<number>, commitment: number): [number, number] {
+  let sum = 0;
+  let best = 0;
+  for (let k = 0; k < N_ASSEMBLIES; k++) {
+    sum += Math.max(0, rates[k]);
+    if (rates[k] > rates[best]) best = k;
+  }
+  let x = 0;
+  let y = 0;
+  if (sum > 1e-9) {
+    for (let k = 0; k < N_ASSEMBLIES; k++) {
+      const s = Math.max(0, rates[k]) / sum;
+      x += s * ANCHORS[k][0];
+      y += s * ANCHORS[k][1];
+    }
+  }
+  const c = Math.max(0, Math.min(1, commitment));
+  return [x * 0.55 * (1 - c) + ANCHORS[best][0] * c, y * 0.55 * (1 - c) + ANCHORS[best][1] * c];
 }
 
 export interface ClusterGroup {

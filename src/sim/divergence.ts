@@ -1,174 +1,80 @@
-import { FIELD_N, MAX_AGENTS } from './constants';
-import { FIELD_MASK, type World } from './world';
+import { N_ASSEMBLIES, N_NEURONS } from './constants';
+import type { Mind } from './mind';
 
 /**
  * DIVERGENCE METRIC
  * =================
  *
- * How different are two futures of the same world? Organisms carry ids that
- * are shared by every world descended from the same origin (a child's id is a
- * hash of its parent's id and the step it was born), so we can ask, organism
- * by organism, "where is this one in the other world?".
+ * How different are two minds that started as one? Every unit exists in
+ * both (same seed, same wiring), so they can be compared unit by unit.
  *
- *   For every id in either world:
- *     present in both  →  c = min(1, distance / D0)      (D0 = 36 units)
- *     present in one   →  c = 1                          (born or died only there)
- *   agentTerm = mean of c over the union of ids
+ *   unitTerm      Σᵢ |aᵢᴬ − aᵢᴮ| / Σᵢ (aᵢᴬ + aᵢᴮ)       activation traces (τ = 50 ms)
+ *   membraneTerm  meanᵢ min(1, |vᵢᴬ − vᵢᴮ| / 0.25)       sub-threshold state
+ *   micro         0.75 · unitTerm + 0.25 · membraneTerm  which units are doing what
  *
- *   fieldTerm = min(1, Σ|fA − fB| / (κ · Σ (fA + fB)/2))   over cells inside the disk,
- *               κ = 0.3, i.e. saturates when the landscapes differ by 30 % of their mean.
+ *   assemblyTerm  Σₖ |rₖᴬ − rₖᴮ| / Σₖ (rₖᴬ + rₖᴮ)       population rates of the six assemblies
+ *                                                     (where the mind is heading)
  *
- *   divergence = 0.85 · agentTerm + 0.15 · fieldTerm        ∈ [0, 1]
+ *   divergence = 0.5 · micro + 0.5 · assemblyTerm        ∈ [0, 1]
  *
- * Read as: the share of the world that is no longer where it would have been.
- * Identical worlds score exactly 0. Two unrelated worlds score ≈ 1. Moving one
- * organism of ~200 by 0.7 units scores ≈ 0.0001.
- *
- * The per-organism c values are also what the renderer uses to draw the faint
- * halo of "touched by the change" — so the spreading halo and the number are
- * the same measurement.
+ * Identical minds score exactly 0. One postponed spike starts near 0.05 %.
+ * Two minds whose spikes have decorrelated but which rest in the same
+ * attractor score roughly 25–40 %; minds resting in different attractors
+ * score 80 % or more. The split between the two halves is what lets the
+ * number tell "the same thought, differently" from "a different thought".
  */
-export const DIVERGENCE_D0 = 36;
-export const DIVERGENCE_KAPPA = 0.3;
-export const DIVERGENCE_AGENT_WEIGHT = 0.85;
-
-/** Open-addressing id → index table; reused to avoid allocation per frame. */
-export class IdIndex {
-  private readonly keys: Uint32Array;
-  private readonly vals: Int32Array;
-  private readonly mask: number;
-
-  constructor(capacity = MAX_AGENTS * 4) {
-    let size = 1;
-    while (size < capacity * 2) size <<= 1;
-    this.keys = new Uint32Array(size);
-    this.vals = new Int32Array(size);
-    this.mask = size - 1;
-  }
-
-  build(ids: ArrayLike<number>, n: number): void {
-    this.keys.fill(0);
-    for (let i = 0; i < n; i++) {
-      const k = ids[i];
-      let h = Math.imul(k, 0x9e3779b1) >>> 0;
-      for (;;) {
-        const slot = h & this.mask;
-        if (this.keys[slot] === 0) {
-          this.keys[slot] = k;
-          this.vals[slot] = i;
-          break;
-        }
-        h++;
-      }
-    }
-  }
-
-  get(k: number): number {
-    let h = Math.imul(k, 0x9e3779b1) >>> 0;
-    for (;;) {
-      const slot = h & this.mask;
-      const v = this.keys[slot];
-      if (v === k) return this.vals[slot];
-      if (v === 0) return -1;
-      h++;
-    }
-  }
-}
-
-export interface AgentSet {
-  n: number;
-  ids: ArrayLike<number>;
-  /** Positions, read as pos[i * stride + offX], pos[i * stride + offX + 1]. */
-  pos: ArrayLike<number>;
-  stride: number;
-  offX: number;
-}
+export const DIVERGENCE_V0 = 0.25;
+export const MICRO_UNIT_WEIGHT = 0.75;
+export const MACRO_WEIGHT = 0.5;
 
 export interface DivergenceResult {
   score: number;
-  agentTerm: number;
-  fieldTerm: number;
+  micro: number;
+  macro: number;
 }
 
-const scratchIndex = new IdIndex();
-
-/**
- * @param cA,cB optional outputs: per-organism c in [0,1] for halos.
- */
+/** Divergence from raw arrays (used on full-precision state and on transferred frames). */
 export function divergenceOf(
-  a: AgentSet,
-  b: AgentSet,
-  fieldA: ArrayLike<number> | null,
-  fieldB: ArrayLike<number> | null,
-  fieldMask: ArrayLike<number> | null,
-  cA?: Float32Array,
-  cB?: Float32Array,
-  index: IdIndex = scratchIndex,
+  traceA: ArrayLike<number>,
+  traceB: ArrayLike<number>,
+  vA: ArrayLike<number> | null,
+  vB: ArrayLike<number> | null,
+  ratesA: ArrayLike<number>,
+  ratesB: ArrayLike<number>,
+  n = N_NEURONS,
 ): DivergenceResult {
-  index.build(b.ids, b.n);
+  let diff = 0;
   let sum = 0;
-  let matched = 0;
-  if (cB) cB.fill(1, 0, b.n);
-  const invD0 = 1 / DIVERGENCE_D0;
-  for (let i = 0; i < a.n; i++) {
-    const j = index.get(a.ids[i]);
-    if (j < 0) {
-      sum += 1;
-      if (cA) cA[i] = 1;
-      continue;
+  for (let i = 0; i < n; i++) {
+    const a = traceA[i];
+    const b = traceB[i];
+    diff += a > b ? a - b : b - a;
+    sum += a + b;
+  }
+  const unitTerm = sum > 1e-12 ? diff / sum : diff > 0 ? 1 : 0;
+  let memTerm = 0;
+  if (vA && vB) {
+    let mv = 0;
+    for (let i = 0; i < n; i++) {
+      const d = vA[i] - vB[i];
+      const c = (d < 0 ? -d : d) / DIVERGENCE_V0;
+      mv += c > 1 ? 1 : c;
     }
-    matched++;
-    const ia = i * a.stride + a.offX;
-    const ib = j * b.stride + b.offX;
-    const dx = a.pos[ia] - b.pos[ib];
-    const dy = a.pos[ia + 1] - b.pos[ib + 1];
-    let c = Math.sqrt(dx * dx + dy * dy) * invD0;
-    if (c > 1) c = 1;
-    sum += c;
-    if (cA) cA[i] = c;
-    if (cB) cB[j] = c;
+    memTerm = mv / n;
   }
-  const unmatchedB = b.n - matched;
-  sum += unmatchedB;
-  const union = a.n + unmatchedB;
-  const agentTerm = union > 0 ? sum / union : 0;
-
-  let fieldTerm = 0;
-  if (fieldA && fieldB) {
-    let diff = 0;
-    let mean = 0;
-    const len = fieldA.length;
-    for (let c = 0; c < len; c++) {
-      if (fieldMask && !fieldMask[c]) continue;
-      const fa = fieldA[c];
-      const fb = fieldB[c];
-      diff += fa > fb ? fa - fb : fb - fa;
-      mean += (fa + fb) * 0.5;
-    }
-    fieldTerm = mean > 1e-9 ? Math.min(1, diff / (DIVERGENCE_KAPPA * mean)) : diff > 0 ? 1 : 0;
+  const micro = vA && vB ? MICRO_UNIT_WEIGHT * unitTerm + (1 - MICRO_UNIT_WEIGHT) * memTerm : unitTerm;
+  let rd = 0;
+  let rs = 0;
+  for (let k = 0; k < N_ASSEMBLIES; k++) {
+    const a = ratesA[k];
+    const b = ratesB[k];
+    rd += a > b ? a - b : b - a;
+    rs += a + b;
   }
-  const w = fieldA && fieldB ? DIVERGENCE_AGENT_WEIGHT : 1;
-  return { score: w * agentTerm + (1 - w) * fieldTerm, agentTerm, fieldTerm };
+  const macro = rs > 1e-12 ? rd / rs : rd > 0 ? 1 : 0;
+  return { score: (1 - MACRO_WEIGHT) * micro + MACRO_WEIGHT * macro, micro, macro };
 }
 
-/** Convenience: divergence between two full world states. */
-export function worldDivergence(a: World, b: World): DivergenceResult {
-  return divergenceOf(
-    { n: a.n, ids: a.id, pos: interleave(a), stride: 2, offX: 0 },
-    { n: b.n, ids: b.id, pos: interleave(b), stride: 2, offX: 0 },
-    a.res,
-    b.res,
-    FIELD_MASK,
-  );
+export function mindDivergence(a: Mind, b: Mind): DivergenceResult {
+  return divergenceOf(a.trace, b.trace, a.v, b.v, a.rate, b.rate);
 }
-
-function interleave(w: World): Float64Array {
-  const out = new Float64Array(w.n * 2);
-  for (let i = 0; i < w.n; i++) {
-    out[i * 2] = w.x[i];
-    out[i * 2 + 1] = w.y[i];
-  }
-  return out;
-}
-
-export const FIELD_CELLS = FIELD_N * FIELD_N;

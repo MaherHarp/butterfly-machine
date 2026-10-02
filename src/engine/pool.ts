@@ -1,6 +1,6 @@
 import type { Intervention } from '../sim';
-import type { FirstDifference, FirstDifferenceRequest, PathEntry } from '../sim/replay';
-import { decodePacket, type WorldFrame } from './packet';
+import type { DivergenceRequest, FirstDivergence, PathEntry } from '../sim/replay';
+import { decodePacket, type MindFrame } from './packet';
 import type { SplitOrder, ToMain, ToWorker } from './protocol';
 import SimWorker from './worker?worker';
 
@@ -11,6 +11,8 @@ export interface SplitRequest {
   mode: 'auto' | 'explicit';
   ivA?: Intervention | null;
   ivB?: Intervention | null;
+  /** Keep both children on one worker and compare them every step (pink lineage of b). */
+  pair?: boolean;
 }
 
 export interface SplitResult {
@@ -22,18 +24,18 @@ export interface SplitResult {
 }
 
 /**
- * A pool of simulation workers holding every living future, stepped in
+ * A pool of simulation workers holding every living mind, stepped in
  * lockstep. The pool never decides *when* to step — the experience's clock
- * does — it only distributes worlds, relays branches, and gathers frames.
+ * does — it only distributes minds, relays branches, and gathers frames.
  */
 export class SimPool {
   private readonly workers: Worker[] = [];
   private readonly pending = new Map<number, (m: ToMain) => void>();
   private nextReq = 1;
-  /** world key → worker index */
+  /** mind key → worker index */
   readonly owner = new Map<number, number>();
-  /** Latest frame of every world, by key. */
-  readonly frames = new Map<number, WorldFrame>();
+  /** Latest frame of every mind, by key. */
+  readonly frames = new Map<number, MindFrame>();
   /** Step of the latest frames. */
   step = 0;
   /** Set while an advance is in flight. */
@@ -58,7 +60,7 @@ export class SimPool {
     }
   }
 
-  get worldCount(): number {
+  get mindCount(): number {
     return this.owner.size;
   }
 
@@ -116,7 +118,7 @@ export class SimPool {
     return best;
   }
 
-  /** Splits worlds: each parent continues as `a` where it lives, `b` goes wherever there is room. */
+  /** Splits minds: each parent continues as `a` where it lives, `b` goes wherever there is room. */
   async split(requests: SplitRequest[]): Promise<SplitResult[]> {
     const load = this.loads();
     const byWorker = new Map<number, SplitOrder[]>();
@@ -126,11 +128,11 @@ export class SimPool {
       if (wi === undefined) continue;
       let target = 0;
       for (let i = 1; i < load.length; i++) if (load[i] < load[target]) target = i;
-      // Keep siblings together when the parent's worker is no busier than average.
-      if (load[wi] <= load[target]) target = wi;
+      // Keep siblings together when the parent's worker is no busier than average (always, for a pair).
+      if (load[wi] <= load[target] || r.pair) target = wi;
       load[target]++;
       destination.set(r.b, target);
-      const order: SplitOrder = { parent: r.parent, a: r.a, b: r.b, mode: r.mode, ivA: r.ivA, ivB: r.ivB, ship: target !== wi };
+      const order: SplitOrder = { parent: r.parent, a: r.a, b: r.b, mode: r.mode, ivA: r.ivA, ivB: r.ivB, ship: target !== wi, pair: r.pair };
       if (!byWorker.has(wi)) byWorker.set(wi, []);
       byWorker.get(wi)!.push(order);
     }
@@ -165,7 +167,7 @@ export class SimPool {
   }
 
   /**
-   * Steps every world to `to` and collects one frame per world.
+   * Steps every mind to `to` and collects one frame per mind.
    * `lod[key]` selects detail; keys beyond the array use `defaultLod`.
    */
   async advance(to: number, lod: Uint8Array, defaultLod: number): Promise<void> {
@@ -183,7 +185,7 @@ export class SimPool {
         ).then((r) => [wi, r] as const);
       }),
     );
-    const frames: WorldFrame[] = [];
+    const frames: MindFrame[] = [];
     let step = this.step;
     for (const [wi, r] of results) {
       if (r.t !== 'packet') continue;
@@ -229,7 +231,22 @@ export class SimPool {
     this.recycle = [];
   }
 
-  async firstDifference(request: FirstDifferenceRequest): Promise<FirstDifference> {
+  /** Pairs two minds held by the same worker: `altered` is compared with `control` every step. */
+  async pair(control: number, altered: number, trace?: ArrayBuffer, roots?: Array<{ step: number; neuron: number }>): Promise<void> {
+    const wi = this.owner.get(altered);
+    if (wi === undefined || this.owner.get(control) !== wi) return;
+    await this.call(wi, { t: 'pair', req: this.req(), control, altered, trace, roots }, trace ? [trace] : []);
+  }
+
+  /** For each unit, the step of its next spike within `horizon` steps if nothing changes (−1 = none). */
+  async peek(key: number, horizon: number): Promise<{ step: number; next: Int32Array } | null> {
+    const wi = this.owner.get(key);
+    if (wi === undefined) return null;
+    const r = await this.call(wi, { t: 'peek', req: this.req(), key, horizon });
+    return r.t === 'peek' && r.step >= 0 ? { step: r.step, next: r.next } : null;
+  }
+
+  async firstDivergence(request: DivergenceRequest): Promise<FirstDivergence> {
     const r = await this.call(0, { t: 'firstDiff', req: this.req(), request }, [request.origin]);
     if (r.t !== 'firstDiff') throw new Error('unexpected reply');
     return r.result;

@@ -1,8 +1,8 @@
 {
   "name": "butterfly-machine",
   "private": true,
-  "version": "1.0.0",
-  "description": "One tiny choice. Hundreds of different worlds. An interactive artwork about sensitivity to initial conditions.",
+  "version": "2.0.0",
+  "description": "One tiny choice. Hundreds of different worlds. A neuro-inspired interactive artwork: delay one spike in a small recurrent network by a few milliseconds and watch it, and then 1,024 copies of it, reach different interpretations of the same image.",
   "type": "module",
   "scripts": {
     "dev": "vite",

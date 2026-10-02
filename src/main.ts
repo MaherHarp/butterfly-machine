@@ -20,7 +20,7 @@ function boot(): void {
   const small = Math.min(window.innerWidth, window.innerHeight) < 600;
   const seedParam = params.get('seed');
   const seed = seedParam !== null && /^\d+$/.test(seedParam) ? Number(seedParam) % 1000000 : randomSeed();
-  // 1,024 futures on capable machines; fewer where cores (or screen) are scarce.
+  // 1,024 minds on capable machines; 256 where cores (or screen) are scarce.
   const maxDepth = small || cores <= 4 ? 8 : 10;
   const workers = Math.max(2, Math.min(12, cores - 2));
   try {
@@ -33,6 +33,8 @@ function boot(): void {
       share: location.hash.includes('f=') ? location.hash : null,
     });
     void director.start();
+    // Developer access (?debug): inspect and drive the director from the console.
+    if (params.has('debug')) (window as unknown as { __bm: Director }).__bm = director;
   } catch (err) {
     console.error(err);
     fail('This artwork needs a browser with WebGL2.<br/>Please try a recent desktop browser.');

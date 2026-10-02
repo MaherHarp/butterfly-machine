@@ -1,9 +1,21 @@
-import { AGENT_STRIDE, LOW_FIELD, REMNANT_STRIDE, type WorldFrame } from '../engine/packet';
-import { FIELD_N, WORLD_RADIUS } from '../sim/constants';
+import { HIGH_FIELD, LOW_FIELD, UNIT_STRIDE, type MindFrame } from '../engine/packet';
+import { N_NEURONS, TYPE_EXC, TYPE_INH, type Network } from '../sim';
 import type { View } from './camera';
 import { DynBuffer, disposeTarget, ensureF32, program, target, texture, type GL, type Program, type Target } from './gl';
 import * as S from './shaders';
-import { ShapeBatch, hslToRgb } from './shapes';
+import { ShapeBatch } from './shapes';
+
+export interface Mood {
+  warmth: number;
+  coherence: number;
+  erasure: number;
+  agitation: number;
+  echo: number;
+  expansion: number;
+  enclosure: number;
+}
+
+export const NO_MOOD: Mood = { warmth: 0, coherence: 0, erasure: 0, agitation: 0, echo: 0, expansion: 0, enclosure: 0 };
 
 export interface TileInput {
   key: number;
@@ -11,19 +23,26 @@ export interface TileInput {
   y: number;
   r: number;
   alpha: number;
-  frame: WorldFrame | null;
+  frame: MindFrame | null;
   hover: number;
   select: number;
+  /** The interpretation's colour, and how much of it to show. */
   tint: [number, number, number];
   tintAmt: number;
   dim: number;
-  sun: [number, number];
-  /** Per-agent divergence (0–1), drawn as halos. */
-  halo?: Float32Array | null;
-  /** Display-only displacement of one organism (while it is being moved). */
-  override?: { index: number; dx: number; dy: number } | null;
-  /** Whether to draw this world's structures. */
-  structures?: boolean;
+  commitment: number;
+  dominant: number;
+  mood: Mood;
+  /** Multiplier on pink (0 for a control mind). */
+  pinkGain: number;
+  /** How strongly causal links are drawn (fades as the change saturates the network). */
+  linkGain?: number;
+  /** Contrast of the stimulus (0–1) shown at the centre. */
+  stimulus: number;
+  /** Draw filaments (only worth it for large minds). */
+  filaments?: boolean;
+  /** Draw individual units (default true when the frame carries them). */
+  units?: boolean;
 }
 
 export interface PostParams {
@@ -37,9 +56,7 @@ export interface PostParams {
 export interface SceneInput {
   tiles: TileInput[];
   view: View;
-  /** Fraction of a step to extrapolate positions by (smooth slow motion). */
-  alpha: number;
-  /** Simulation steps that elapsed since the previous frame (drives trail decay). */
+  /** Simulation steps that elapsed since the previous frame (drives afterglow decay). */
   stepsAdvanced: number;
   time: number;
   under: ShapeBatch;
@@ -48,16 +65,20 @@ export interface SceneInput {
 }
 
 const MAX_TILES = 2048;
+const TILE_ROWS = 6;
 const LOW_COLS = 64;
 const LOW_ROWS = 32;
 const HIGH_COLS = 8;
 const HIGH_ROWS = 8;
 
+const CREAM: [number, number, number] = [1.0, 0.93, 0.82];
+const PINK: [number, number, number] = [1.0, 0.16, 0.52];
+
 /**
  * The renderer is stateless with respect to the experience: give it tiles,
  * frames and a camera, and it draws. One WebGL2 context, instanced
- * everything, a screen-space trail buffer reprojected through camera motion,
- * and a soft bloom.
+ * everything, an afterglow buffer reprojected through camera motion, and a
+ * soft bloom.
  */
 export class Renderer {
   readonly gl: GL;
@@ -67,7 +88,7 @@ export class Renderer {
 
   private pBg: Program;
   private pTile: Program;
-  private pAgent: Program;
+  private pUnit: Program;
   private pTrailDot: Program;
   private pTrailFade: Program;
   private pCopy: Program;
@@ -78,21 +99,21 @@ export class Renderer {
 
   private quad: WebGLBuffer;
   private vaoTile: WebGLVertexArrayObject;
-  private vaoAgent: WebGLVertexArrayObject;
+  private vaoUnit: WebGLVertexArrayObject;
   private vaoShape: WebGLVertexArrayObject;
   private vaoEmpty: WebGLVertexArrayObject;
   private tileIdxBuf: DynBuffer;
   private instBuf: DynBuffer;
   private instTileBuf: DynBuffer;
-  private instHaloBuf: DynBuffer;
   private shapeBuf: DynBuffer;
 
   private tileTex: WebGLTexture;
-  private tileData = new Float32Array(MAX_TILES * 4 * 4);
+  private tileData = new Float32Array(MAX_TILES * 4 * TILE_ROWS);
+  private unitTex: WebGLTexture;
   private lowTex: WebGLTexture;
   private lowData = new Uint8Array(LOW_COLS * LOW_FIELD * LOW_ROWS * LOW_FIELD * 2);
   private highTex: WebGLTexture;
-  private highSlots = new Map<number, { slot: number; frame: WorldFrame | null; used: number }>();
+  private highSlots = new Map<number, { slot: number; frame: MindFrame | null; used: number }>();
   private frameNo = 0;
 
   private scene: Target | null = null;
@@ -105,12 +126,12 @@ export class Renderer {
 
   private inst: Float32Array<ArrayBuffer> = new Float32Array(8192);
   private instTile: Float32Array<ArrayBuffer> = new Float32Array(1024);
-  private instHalo: Float32Array<ArrayBuffer> = new Float32Array(1024);
   private tileIdx = new Float32Array(MAX_TILES);
   private prevView: View | null = null;
-  readonly structures = new ShapeBatch();
+  private net: Network | null = null;
+  readonly filaments = new ShapeBatch();
 
-  stats = { tiles: 0, agents: 0, shapes: 0 };
+  stats = { tiles: 0, units: 0, shapes: 0 };
 
   constructor(readonly canvas: HTMLCanvasElement) {
     const gl = canvas.getContext('webgl2', {
@@ -129,7 +150,7 @@ export class Renderer {
 
     this.pBg = program(gl, S.FULLSCREEN_VS, S.BACKGROUND_FS, 'background');
     this.pTile = program(gl, S.TILE_VS, S.TILE_FS, 'tile');
-    this.pAgent = program(gl, S.AGENT_VS, S.AGENT_FS, 'agent');
+    this.pUnit = program(gl, S.UNIT_VS, S.UNIT_FS, 'unit');
     this.pTrailDot = program(gl, S.TRAIL_DOT_VS, S.TRAIL_DOT_FS, 'trailDot');
     this.pTrailFade = program(gl, S.FULLSCREEN_VS, S.TRAIL_FADE_FS, 'trailFade');
     this.pCopy = program(gl, S.FULLSCREEN_VS, S.COPY_FS, 'copy');
@@ -145,7 +166,6 @@ export class Renderer {
     this.tileIdxBuf = new DynBuffer(gl);
     this.instBuf = new DynBuffer(gl);
     this.instTileBuf = new DynBuffer(gl);
-    this.instHaloBuf = new DynBuffer(gl);
     this.shapeBuf = new DynBuffer(gl);
 
     this.vaoEmpty = gl.createVertexArray()!;
@@ -158,24 +178,17 @@ export class Renderer {
     gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 4, 0);
     gl.vertexAttribDivisor(1, 1);
 
-    this.vaoAgent = gl.createVertexArray()!;
-    gl.bindVertexArray(this.vaoAgent);
+    this.vaoUnit = gl.createVertexArray()!;
+    gl.bindVertexArray(this.vaoUnit);
     this.bindQuad();
     gl.bindBuffer(gl.ARRAY_BUFFER, this.instBuf.buf);
     gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, AGENT_STRIDE * 4, 0);
+    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, UNIT_STRIDE * 4, 0);
     gl.vertexAttribDivisor(1, 1);
-    gl.enableVertexAttribArray(2);
-    gl.vertexAttribPointer(2, 4, gl.FLOAT, false, AGENT_STRIDE * 4, 16);
-    gl.vertexAttribDivisor(2, 1);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.instTileBuf.buf);
-    gl.enableVertexAttribArray(3);
-    gl.vertexAttribPointer(3, 1, gl.FLOAT, false, 4, 0);
-    gl.vertexAttribDivisor(3, 1);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.instHaloBuf.buf);
-    gl.enableVertexAttribArray(4);
-    gl.vertexAttribPointer(4, 1, gl.FLOAT, false, 4, 0);
-    gl.vertexAttribDivisor(4, 1);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 4, 0);
+    gl.vertexAttribDivisor(2, 1);
 
     this.vaoShape = gl.createVertexArray()!;
     gl.bindVertexArray(this.vaoShape);
@@ -188,10 +201,32 @@ export class Renderer {
     }
     gl.bindVertexArray(null);
 
-    this.tileTex = texture(gl, MAX_TILES, 4, gl.RGBA32F, gl.RGBA, gl.FLOAT, gl.NEAREST);
+    this.tileTex = texture(gl, MAX_TILES, TILE_ROWS, gl.RGBA32F, gl.RGBA, gl.FLOAT, gl.NEAREST);
+    this.unitTex = texture(gl, N_NEURONS, 2, gl.RGBA32F, gl.RGBA, gl.FLOAT, gl.NEAREST);
     this.lowTex = texture(gl, LOW_COLS * LOW_FIELD, LOW_ROWS * LOW_FIELD, gl.RG8, gl.RG, gl.UNSIGNED_BYTE, gl.LINEAR);
-    this.highTex = texture(gl, HIGH_COLS * FIELD_N, HIGH_ROWS * FIELD_N, gl.RG8, gl.RG, gl.UNSIGNED_BYTE, gl.LINEAR);
+    this.highTex = texture(gl, HIGH_COLS * HIGH_FIELD, HIGH_ROWS * HIGH_FIELD, gl.RG8, gl.RG, gl.UNSIGNED_BYTE, gl.LINEAR);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  }
+
+  /** The wiring all minds share: unit positions and types become a texture. */
+  setNetwork(net: Network): void {
+    if (this.net === net) return;
+    this.net = net;
+    const d = new Float32Array(N_NEURONS * 4 * 2);
+    for (let i = 0; i < N_NEURONS; i++) {
+      d[i * 4] = net.x[i];
+      d[i * 4 + 1] = net.y[i];
+      d[i * 4 + 2] = net.type[i];
+      d[i * 4 + 3] = net.group[i];
+      const o = (N_NEURONS + i) * 4;
+      d[o] = net.tidyX[i];
+      d[o + 1] = net.tidyY[i];
+      d[o + 2] = net.hash[i];
+      d[o + 3] = Math.sqrt(net.x[i] * net.x[i] + net.y[i] * net.y[i]);
+    }
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, this.unitTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, N_NEURONS, 2, gl.RGBA, gl.FLOAT, d);
   }
 
   private bindQuad(): void {
@@ -231,7 +266,7 @@ export class Renderer {
     return [this.width, this.height];
   }
 
-  /** Forget trails (e.g. after a hard cut). */
+  /** Forget afterglow (e.g. after a hard cut). */
   clearTrails(): void {
     const gl = this.gl;
     for (const t of [this.trailA, this.trailB]) {
@@ -263,83 +298,71 @@ export class Renderer {
     const rowStride = MAX_TILES * 4;
     for (let i = 0; i < nTiles; i++) {
       const t = tiles[i];
-      const o0 = i * 4;
-      td[o0] = t.x;
-      td[o0 + 1] = t.y;
-      td[o0 + 2] = t.r;
-      td[o0 + 3] = t.alpha;
+      const o = i * 4;
+      td[o] = t.x;
+      td[o + 1] = t.y;
+      td[o + 2] = t.r;
+      td[o + 3] = t.alpha;
       let high = -1;
       let low = -1;
       const f = t.frame;
       if (f && f.field) {
-        if (f.fieldRes === FIELD_N) high = this.uploadHigh(t.key, f);
+        if (f.fieldRes === HIGH_FIELD) high = this.uploadHigh(t.key, f);
         else if (f.fieldRes === LOW_FIELD && i < LOW_COLS * LOW_ROWS) {
           low = i;
           this.copyLow(i, f.field);
           lowDirty = true;
         }
       }
-      const o1 = rowStride + o0;
-      td[o1] = high;
-      td[o1 + 1] = low;
-      td[o1 + 2] = t.hover;
-      td[o1 + 3] = t.select;
-      const o2 = rowStride * 2 + o0;
-      td[o2] = t.sun[0];
-      td[o2 + 1] = t.sun[1];
-      td[o2 + 2] = t.tintAmt;
-      td[o2 + 3] = 1;
-      const o3 = rowStride * 3 + o0;
-      td[o3] = t.tint[0];
-      td[o3 + 1] = t.tint[1];
-      td[o3 + 2] = t.tint[2];
-      td[o3 + 3] = t.dim;
+      const m = t.mood;
+      const rows = [
+        [high, low, t.hover, t.select],
+        [t.commitment, t.dominant, t.tintAmt, t.pinkGain],
+        [t.tint[0], t.tint[1], t.tint[2], t.dim],
+        [m.warmth, m.coherence, m.erasure, m.agitation],
+        [m.echo, m.expansion, m.enclosure, t.stimulus],
+      ];
+      for (let r = 0; r < rows.length; r++) {
+        const q = rowStride * (r + 1) + o;
+        td[q] = rows[r][0];
+        td[q + 1] = rows[r][1];
+        td[q + 2] = rows[r][2];
+        td[q + 3] = rows[r][3];
+      }
       this.tileIdx[i] = i;
     }
     gl.bindTexture(gl.TEXTURE_2D, this.tileTex);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_TILES, 4, gl.RGBA, gl.FLOAT, td);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAX_TILES, TILE_ROWS, gl.RGBA, gl.FLOAT, td);
     if (lowDirty) {
       gl.bindTexture(gl.TEXTURE_2D, this.lowTex);
       gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, LOW_COLS * LOW_FIELD, LOW_ROWS * LOW_FIELD, gl.RG, gl.UNSIGNED_BYTE, this.lowData);
     }
     this.tileIdxBuf.upload(this.tileIdx, nTiles);
 
-    // ---- organism instances ------------------------------------------------
+    // ---- unit instances ------------------------------------------------------
     let total = 0;
     for (let i = 0; i < nTiles; i++) {
       const f = tiles[i].frame;
-      if (f && tiles[i].alpha > 0.002) total += f.n;
+      if (f && f.n === N_NEURONS && tiles[i].alpha > 0.002 && tiles[i].units !== false) total += N_NEURONS;
     }
-    this.inst = ensureF32(this.inst, total * AGENT_STRIDE);
+    this.inst = ensureF32(this.inst, total * UNIT_STRIDE);
     this.instTile = ensureF32(this.instTile, total);
-    this.instHalo = ensureF32(this.instHalo, total);
     let off = 0;
-    const structures = this.structures;
-    structures.clear();
+    const fil = this.filaments;
+    fil.clear();
     for (let i = 0; i < nTiles; i++) {
       const t = tiles[i];
       const f = t.frame;
-      if (!f || t.alpha <= 0.002) continue;
-      const n = f.n;
-      if (n > 0) {
-        this.inst.set(f.agents.subarray(0, n * AGENT_STRIDE), off * AGENT_STRIDE);
-        this.instTile.fill(i, off, off + n);
-        if (t.halo) this.instHalo.set(t.halo.subarray(0, n), off);
-        else this.instHalo.fill(0, off, off + n);
-        if (t.override && t.override.index >= 0 && t.override.index < n) {
-          const k = (off + t.override.index) * AGENT_STRIDE;
-          this.inst[k] += t.override.dx;
-          this.inst[k + 1] += t.override.dy;
-        }
-        off += n;
-      }
-      if (t.structures !== false && f.remnants && f.nRemnants > 0) this.addStructures(t, f, view.zoom);
+      if (!f || f.n !== N_NEURONS || t.alpha <= 0.002 || t.units === false) continue;
+      this.inst.set(f.units.subarray(0, N_NEURONS * UNIT_STRIDE), off * UNIT_STRIDE);
+      this.instTile.fill(i, off, off + N_NEURONS);
+      off += N_NEURONS;
+      if (t.filaments && this.net) this.addFilaments(t, f, view.zoom);
     }
     this.stats.tiles = nTiles;
-    this.stats.agents = off;
-    this.instBuf.upload(this.inst, off * AGENT_STRIDE);
+    this.stats.units = off;
+    this.instBuf.upload(this.inst, off * UNIT_STRIDE);
     this.instTileBuf.upload(this.instTile, off);
-    this.instHaloBuf.upload(this.instHalo, off);
 
     // ---- scene ---------------------------------------------------------------
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.scene.fb);
@@ -356,7 +379,7 @@ export class Renderer {
     gl.blendFunc(gl.ONE, gl.ONE);
     this.drawShapes(input.under, view);
 
-    // Worlds.
+    // Minds.
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(this.pTile.prog);
     this.setView(this.pTile, view);
@@ -370,12 +393,12 @@ export class Renderer {
     gl.bindTexture(gl.TEXTURE_2D, this.highTex);
     gl.uniform1i(this.pTile.u.uHigh, 2);
     gl.uniform2f(this.pTile.u.uLowGrid, LOW_COLS, LOW_FIELD);
-    gl.uniform2f(this.pTile.u.uHighGrid, HIGH_COLS, FIELD_N);
+    gl.uniform2f(this.pTile.u.uHighGrid, HIGH_COLS, HIGH_FIELD);
     gl.uniform1f(this.pTile.u.uTime, input.time);
     gl.bindVertexArray(this.vaoTile);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, nTiles);
 
-    // Trails.
+    // Afterglow.
     this.updateTrails(input, off);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.scene.fb);
     gl.viewport(0, 0, W, H);
@@ -389,21 +412,24 @@ export class Renderer {
     gl.uniform1f(this.pCopy.u.uGain, 1);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-    // Structures, organisms, overlays.
-    this.drawShapes(structures, view);
+    // Filaments, units, overlays.
+    this.drawShapes(fil, view);
     if (off > 0) {
-      gl.useProgram(this.pAgent.prog);
-      this.setView(this.pAgent, view);
+      gl.useProgram(this.pUnit.prog);
+      this.setView(this.pUnit, view);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, this.tileTex);
-      gl.uniform1i(this.pAgent.u.uTiles, 0);
-      gl.uniform1f(this.pAgent.u.uAlpha, input.alpha);
-      gl.uniform1f(this.pAgent.u.uTime, input.time);
-      gl.bindVertexArray(this.vaoAgent);
+      gl.uniform1i(this.pUnit.u.uTiles, 0);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, this.unitTex);
+      gl.uniform1i(this.pUnit.u.uUnits, 1);
+      gl.uniform1i(this.pUnit.u.uN, N_NEURONS);
+      gl.uniform1f(this.pUnit.u.uTime, input.time);
+      gl.bindVertexArray(this.vaoUnit);
       gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, off);
     }
     this.drawShapes(input.over, view);
-    this.stats.shapes = input.under.count + structures.count + input.over.count;
+    this.stats.shapes = input.under.count + fil.count + input.over.count;
 
     // ---- post ------------------------------------------------------------------
     gl.disable(gl.BLEND);
@@ -446,10 +472,10 @@ export class Renderer {
     const B = this.trailB!;
     const view = input.view;
     const prev = this.prevView ?? view;
-    // Trails age with simulation time, not wall time: frozen time freezes them.
-    const steps = Math.max(0, Math.min(8, input.stepsAdvanced));
+    // Afterglow ages with network time, not wall time: frozen time freezes it.
+    const steps = Math.max(0, Math.min(40, input.stepsAdvanced));
     const zoomChange = Math.abs(Math.log(view.zoom / prev.zoom));
-    const decay = Math.pow(0.955, steps) * Math.exp(-zoomChange * 2.5);
+    const decay = Math.pow(0.975, steps) * Math.exp(-zoomChange * 2.5);
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, B.fb);
     gl.viewport(0, 0, B.w, B.h);
@@ -464,7 +490,7 @@ export class Renderer {
     gl.uniform4f(pf.u.uPrevCam, prev.x, prev.y, prev.zoom, 0);
     gl.uniform2f(pf.u.uViewport, this.width, this.height);
     gl.uniform1f(pf.u.uDecay, decay);
-    gl.uniform1f(pf.u.uSub, this.hdr ? 0.0004 * steps : 0.0025 * Math.min(1, steps));
+    gl.uniform1f(pf.u.uSub, this.hdr ? 0.0002 * steps : 0.0025 * Math.min(1, steps));
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     if (count > 0 && steps > 0) {
@@ -476,10 +502,15 @@ export class Renderer {
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, this.tileTex);
       gl.uniform1i(pd.u.uTiles, 0);
-      gl.uniform1f(pd.u.uAlpha, input.alpha);
-      gl.uniform1f(pd.u.uDeposit, Math.min(2, steps));
-      gl.bindVertexArray(this.vaoAgent);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, this.unitTex);
+      gl.uniform1i(pd.u.uUnits, 1);
+      gl.uniform1i(pd.u.uN, N_NEURONS);
+      gl.uniform1f(pd.u.uTime, input.time);
+      gl.uniform1f(pd.u.uDeposit, Math.min(3, 0.4 + steps * 0.25));
+      gl.bindVertexArray(this.vaoUnit);
       gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
+      gl.activeTexture(gl.TEXTURE0);
     }
     this.trailA = B;
     this.trailB = A;
@@ -538,7 +569,7 @@ export class Renderer {
     }
   }
 
-  private uploadHigh(key: number, f: WorldFrame): number {
+  private uploadHigh(key: number, f: MindFrame): number {
     let entry = this.highSlots.get(key);
     if (!entry) {
       let slot = -1;
@@ -569,37 +600,77 @@ export class Renderer {
     if (entry.frame !== f && f.field) {
       const gl = this.gl;
       gl.bindTexture(gl.TEXTURE_2D, this.highTex);
-      const sx = (entry.slot % HIGH_COLS) * FIELD_N;
-      const sy = Math.floor(entry.slot / HIGH_COLS) * FIELD_N;
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, sx, sy, FIELD_N, FIELD_N, gl.RG, gl.UNSIGNED_BYTE, f.field);
+      const sx = (entry.slot % HIGH_COLS) * HIGH_FIELD;
+      const sy = Math.floor(entry.slot / HIGH_COLS) * HIGH_FIELD;
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, sx, sy, HIGH_FIELD, HIGH_FIELD, gl.RG, gl.UNSIGNED_BYTE, f.field);
       entry.frame = f;
     }
     return entry.slot;
   }
 
-  /** Remnant structures: luminous nodes and the filaments that join them. */
-  private addStructures(t: TileInput, f: WorldFrame, zoom: number): void {
-    const rem = f.remnants!;
-    const scale = t.r / WORLD_RADIUS;
-    const pxPerUnit = scale * zoom;
-    if (pxPerUnit < 0.25) return;
-    const detail = Math.min(1, (pxPerUnit - 0.25) / 0.5);
-    const a = t.alpha * detail;
-    const lineW = Math.min(2.2, Math.max(0.6, 0.55 * pxPerUnit));
-    for (let k = 0; k < f.nRemnants; k++) {
-      const q = k * REMNANT_STRIDE;
-      const s = rem[q + 2];
-      if (s <= 0.01) continue;
-      const [r, g, b] = hslToRgb(rem[q + 3], 0.35, 0.72);
-      const px = t.x + rem[q] * scale;
-      const py = t.y + rem[q + 1] * scale;
-      const lx = rem[q + 4];
-      const fade = Math.min(1, s * 1.6);
-      if (Number.isFinite(lx)) {
-        const ly = rem[q + 5];
-        this.structures.line(px, py, t.x + lx * scale, t.y + ly * scale, lineW, r * 0.8, g * 0.75, b * 0.7, 0.32 * fade * a, 1.5);
+  /**
+   * Filaments: each unit's few nearest real synapses, drawn as faint curved
+   * fibres. A spike travels along them as a small comet that takes exactly
+   * the synapse's delay to arrive — pink if that unit's behaviour is part of
+   * the causal lineage.
+   */
+  private addFilaments(t: TileInput, f: MindFrame, zoom: number): void {
+    const net = this.net!;
+    const pxPerUnit = t.r * zoom;
+    if (pxPerUnit < 90) return;
+    const detail = Math.min(1, (pxPerUnit - 90) / 160);
+    const a0 = t.alpha * (1 - t.dim * 0.8);
+    const lw = Math.min(1.4, Math.max(0.6, pxPerUnit / 520));
+    const u = f.units;
+    const pg = t.pinkGain;
+    const lg = t.linkGain ?? 1;
+    const { drawStart, drawSyn, outTarget, outDelay, x, y, type, hash } = net;
+    for (let i = 0; i < N_NEURONS; i++) {
+      const since = u[i * UNIT_STRIDE + 2];
+      const pink = Math.min(1, u[i * UNIT_STRIDE + 3] * pg);
+      const xi = t.x + x[i] * t.r;
+      const yi = t.y + y[i] * t.r;
+      // The causal link: from the unit whose changed spike reached this one.
+      const by = u[i * UNIT_STRIDE + 4];
+      // Drawn while the unit is flashing (a fresh change), so the lineage reads as lightning, not a web.
+      const flashP = pink - 0.32;
+      if (pg > 0 && flashP > 0 && by >= 0 && lg > 0.01) {
+        const xj = t.x + x[by] * t.r;
+        const yj = t.y + y[by] * t.r;
+        this.filaments.line(xj, yj, xi, yi, lw * 1.2, PINK[0], PINK[1], PINK[2], a0 * 0.75 * flashP * flashP * lg, 1.5);
       }
-      this.structures.disc(px, py, (1.1 + 1.2 * s) * scale, r, g * 0.92, b * 0.85, 0.55 * fade * a, 2.5);
+      const isI = type[i] === TYPE_INH;
+      for (let k = drawStart[i]; k < drawStart[i + 1]; k++) {
+        const s = drawSyn[k];
+        const j = outTarget[s];
+        const xj = t.x + x[j] * t.r;
+        const yj = t.y + y[j] * t.r;
+        // A gentle bend, always the same for the same fibre.
+        const bend = (hash[(i * 7 + j) % N_NEURONS] - 0.5) * 0.35;
+        const mx = (xi + xj) / 2 - (yj - yi) * bend;
+        const my = (yi + yj) / 2 + (xj - xi) * bend;
+        const base = (isI ? 0.018 : 0.03) * detail * a0;
+        const cr = CREAM[0] * (1 - pink) + PINK[0] * pink;
+        const cg = CREAM[1] * (1 - pink) + PINK[1] * pink;
+        const cb = CREAM[2] * (1 - pink) + PINK[2] * pink;
+        const glowA = base * (1 + pink * 4);
+        this.filaments.line(xi, yi, mx, my, lw, cr, cg, cb, glowA, 0);
+        this.filaments.line(mx, my, xj, yj, lw, cr, cg, cb, glowA, 0);
+        // A spike in transit.
+        const d = outDelay[s];
+        if (since >= 0 && since <= d + 1) {
+          const p = Math.min(1, (since + 0.5) / d);
+          const q = Math.max(0, p - 0.18);
+          const at = (v: number): [number, number] => {
+            const w = 1 - v;
+            return [w * w * xi + 2 * w * v * mx + v * v * xj, w * w * yi + 2 * w * v * my + v * v * yj];
+          };
+          const [ax, ay] = at(q);
+          const [bx, by] = at(p);
+          const strength = (isI ? 0.12 : 0.26) * a0 * (1 - Math.max(0, since - d) * 0.5);
+          this.filaments.line(ax, ay, bx, by, lw * 1.1, cr, cg, cb, strength * (1 + pink * 1.5), 1.5 + pink * 2);
+        }
+      }
     }
   }
 
@@ -608,3 +679,5 @@ export class Renderer {
     return new Promise((resolve) => this.canvas.toBlob((b) => resolve(b), 'image/png'));
   }
 }
+
+export { TYPE_EXC };

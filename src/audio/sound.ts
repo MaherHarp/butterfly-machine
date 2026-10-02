@@ -1,43 +1,50 @@
 /**
  * Procedural sound. Nothing is pre-recorded and nothing loops: every voice
- * is driven by simulation state.
+ * is driven by the network's state.
  *
- *   lineage composition  →  harmony: each founder lineage owns one tone of an
- *                           open chord; its loudness is its share of the world.
- *                           A world taken over by one lineage hums one note;
- *                           a diverse world sounds the whole chord; an empty
- *                           world is silent.
- *   resource / energy    →  brightness (low-pass cutoff)
- *   hunters              →  a low, slow pulse
- *   motion               →  breath of filtered noise
- *   births               →  soft bells, pitched by lineage
- *   catches              →  muted percussive ticks
+ *   assembly activity   →  harmony: each assembly owns one tone of an open
+ *                          chord, as loud as its share of the activity. An
+ *                          undecided mind sounds the whole chord, shimmering;
+ *                          as it settles into an attractor the chord collapses
+ *                          onto that assembly's tone and its fifth, and the
+ *                          shimmer stills (tonal stability).
+ *   inhibition          →  a low, slow pulse
+ *   spiking density     →  breath of filtered noise
+ *   spikes              →  tiny transients
+ *   pink (causal)       →  a glassy, high shimmer — the change, audible
+ *   settling            →  a soft bell on that assembly's tone
  *
- * Two futures play in two places: World A on the left, World B on the right.
- * While they are the same, you hear one sound. As they diverge, the stereo
- * image comes apart. Many futures are summed into one aggregate field.
+ * Two minds play in two places, the original on the left and the altered on
+ * the right. While they are the same you hear one sound; as they diverge,
+ * the stereo image comes apart. Many minds are summed into one field.
  */
 
-const CHORD = [110.0, 164.81, 196.0, 246.94, 293.66, 369.99];
-const BELL_SCALE = [440.0, 659.25, 783.99, 987.77, 1174.66, 1479.98];
+const CHORD = [146.83, 196.0, 220.0, 293.66, 329.63, 392.0];
+const TICK = [587.33, 783.99, 880.0, 1174.66, 1318.51, 1567.98, 440.0, 659.25];
 
 export interface VoiceState {
   /** −1 … 1 */
   pan: number;
-  /** Share of each lineage among grazers (sums to ≤ 1). */
+  /** Share of activity of each assembly (sums to ≤ 1). */
   shares: number[];
-  /** Population relative to a healthy world (0 … ~1.5). */
-  vitality: number;
-  hunters: number;
-  resource: number;
-  motion: number;
+  /** Overall excitatory activity (0 … ~1.5). */
+  activity: number;
+  /** Inhibitory rate (Hz). */
+  inhibition: number;
+  /** How settled the mind is in an attractor (0 … 1). */
+  stability: number;
+  /** Share of the network carrying the change (0 … 1). */
+  pink: number;
+  /** Spikes per step. */
+  density: number;
   /** Overall loudness 0 … 1. */
   level: number;
 }
 
 export interface SoundEvent {
-  type: 'birth' | 'catch' | 'death';
-  lineage: number;
+  type: 'spike' | 'pinkspike' | 'settle' | 'release';
+  /** Assembly index, or 6 (inhibitory) / 7 (sensory). */
+  voice: number;
   pan: number;
   gain: number;
 }
@@ -46,8 +53,12 @@ class Voice {
   readonly out: StereoPannerNode;
   private readonly filter: BiquadFilterNode;
   private readonly tones: GainNode[] = [];
+  private readonly fifths: GainNode[] = [];
+  private readonly shimmer: GainNode[] = [];
   private readonly sub: GainNode;
+  private readonly subRate: OscillatorNode;
   private readonly noise: GainNode;
+  private readonly glass: GainNode;
   private readonly bus: GainNode;
 
   constructor(ctx: AudioContext, dest: AudioNode, noiseBuf: AudioBuffer, detune: number) {
@@ -57,8 +68,8 @@ class Voice {
     this.bus.gain.value = 0;
     this.filter = ctx.createBiquadFilter();
     this.filter.type = 'lowpass';
-    this.filter.frequency.value = 800;
-    this.filter.Q.value = 0.6;
+    this.filter.frequency.value = 900;
+    this.filter.Q.value = 0.5;
     this.filter.connect(this.bus);
     this.bus.connect(this.out);
 
@@ -66,70 +77,104 @@ class Voice {
       const g = ctx.createGain();
       g.gain.value = 0;
       g.connect(this.filter);
-      const o1 = ctx.createOscillator();
-      o1.type = 'sine';
-      o1.frequency.value = f;
-      o1.detune.value = detune + (i % 2 ? 3 : -3);
-      const o2 = ctx.createOscillator();
-      o2.type = 'triangle';
-      o2.frequency.value = f * 2;
-      o2.detune.value = detune - 4;
-      const g2 = ctx.createGain();
-      g2.gain.value = 0.18;
-      o1.connect(g);
-      o2.connect(g2).connect(g);
-      // Slow individual shimmer.
+      const o = ctx.createOscillator();
+      o.type = 'sine';
+      o.frequency.value = f;
+      o.detune.value = detune + (i % 2 ? 2 : -2);
+      o.connect(g);
+      // The fifth above, heard only once the mind has settled on this tone.
+      const g5 = ctx.createGain();
+      g5.gain.value = 0;
+      g5.connect(this.filter);
+      const o5 = ctx.createOscillator();
+      o5.type = 'triangle';
+      o5.frequency.value = f * 1.5;
+      o5.detune.value = detune;
+      o5.connect(g5);
+      // Unsettled shimmer: a slow vibrato whose depth follows instability.
       const lfo = ctx.createOscillator();
-      lfo.frequency.value = 0.05 + i * 0.023;
-      const lg = ctx.createGain();
-      lg.gain.value = 4;
-      lfo.connect(lg).connect(o1.detune);
-      o1.start();
-      o2.start();
+      lfo.frequency.value = 0.11 + i * 0.037;
+      const depth = ctx.createGain();
+      depth.gain.value = 0;
+      lfo.connect(depth).connect(o.detune);
+      o.start();
+      o5.start();
       lfo.start();
       this.tones.push(g);
+      this.fifths.push(g5);
+      this.shimmer.push(depth);
     });
 
     this.sub = ctx.createGain();
     this.sub.gain.value = 0;
     const so = ctx.createOscillator();
     so.frequency.value = 55;
-    const trem = ctx.createOscillator();
-    trem.frequency.value = 0.35;
+    this.subRate = ctx.createOscillator();
+    this.subRate.frequency.value = 0.5;
     const tg = ctx.createGain();
     tg.gain.value = 0.5;
     const subAmp = ctx.createGain();
     subAmp.gain.value = 0.5;
-    trem.connect(tg).connect(subAmp.gain);
+    this.subRate.connect(tg).connect(subAmp.gain);
     so.connect(subAmp).connect(this.sub).connect(this.bus);
     so.start();
-    trem.start();
+    this.subRate.start();
 
     const src = ctx.createBufferSource();
     src.buffer = noiseBuf;
     src.loop = true;
     const bp = ctx.createBiquadFilter();
     bp.type = 'bandpass';
-    bp.frequency.value = 900;
-    bp.Q.value = 0.7;
+    bp.frequency.value = 1100;
+    bp.Q.value = 0.8;
     this.noise = ctx.createGain();
     this.noise.gain.value = 0;
     src.connect(bp).connect(this.noise).connect(this.bus);
     src.start(0, Math.random() * 2);
+
+    // Pink: two inharmonic high partials with a fast tremolo.
+    this.glass = ctx.createGain();
+    this.glass.gain.value = 0;
+    this.glass.connect(this.out);
+    const trem = ctx.createOscillator();
+    trem.frequency.value = 5.3;
+    const tAmt = ctx.createGain();
+    tAmt.gain.value = 0.4;
+    const gAmp = ctx.createGain();
+    gAmp.gain.value = 0.6;
+    trem.connect(tAmt).connect(gAmp.gain);
+    for (const f of [1864.7, 2489.0 * 1.003]) {
+      const o = ctx.createOscillator();
+      o.type = 'sine';
+      o.frequency.value = f;
+      o.detune.value = detune * 3;
+      o.connect(gAmp);
+      o.start();
+    }
+    gAmp.connect(this.glass);
+    trem.start();
   }
 
   set(s: VoiceState, t: number): void {
-    const tc = 0.6;
     this.out.pan.setTargetAtTime(Math.max(-1, Math.min(1, s.pan)), t, 0.3);
-    const vit = Math.max(0, Math.min(1.4, s.vitality));
     this.bus.gain.setTargetAtTime(s.level * 0.9, t, 0.4);
+    const act = Math.max(0.15, Math.min(1.3, s.activity + 0.25));
+    const stab = Math.max(0, Math.min(1, s.stability));
+    let dom = 0;
+    for (let i = 1; i < this.tones.length; i++) if ((s.shares[i] ?? 0) > (s.shares[dom] ?? 0)) dom = i;
     for (let i = 0; i < this.tones.length; i++) {
       const share = s.shares[i] ?? 0;
-      this.tones[i].gain.setTargetAtTime(Math.sqrt(share) * 0.06 * vit, t, tc);
+      const isDom = i === dom;
+      const g = Math.sqrt(share) * 0.05 * act * (isDom ? 1 + stab * 0.6 : 1 - stab * 0.75);
+      this.tones[i].gain.setTargetAtTime(g, t, 0.7);
+      this.fifths[i].gain.setTargetAtTime(isDom ? 0.022 * stab * act : 0, t, 0.9);
+      this.shimmer[i].gain.setTargetAtTime(14 * (1 - stab), t, 1.2);
     }
-    this.filter.frequency.setTargetAtTime(260 + 2600 * Math.pow(Math.max(0, Math.min(1, s.resource)), 1.2), t, 0.8);
-    this.sub.gain.setTargetAtTime(Math.min(1, s.hunters / 14) * 0.05, t, 0.8);
-    this.noise.gain.setTargetAtTime(Math.min(1, s.motion / 1.4) * 0.012 * vit, t, 0.8);
+    this.filter.frequency.setTargetAtTime(380 + 1900 * Math.min(1, s.activity), t, 0.8);
+    this.sub.gain.setTargetAtTime(Math.min(1, s.inhibition / 30) * 0.035, t, 0.8);
+    this.subRate.frequency.setTargetAtTime(0.25 + Math.min(2, s.inhibition / 20), t, 1);
+    this.noise.gain.setTargetAtTime(Math.min(1, s.density / 12) * 0.01 * s.level, t, 0.6);
+    this.glass.gain.setTargetAtTime(Math.min(1, s.pink) * 0.009 * s.level, t, 0.5);
   }
 }
 
@@ -171,9 +216,9 @@ export class Sound {
     master.gain.setTargetAtTime(this.muted ? 0 : 0.9, ctx.currentTime, 1.5);
 
     const reverb = ctx.createConvolver();
-    reverb.buffer = impulse(ctx, 3.2, 2.6);
+    reverb.buffer = impulse(ctx, 3.4, 2.6);
     const wet = ctx.createGain();
-    wet.gain.value = 0.55;
+    wet.gain.value = 0.6;
     reverb.connect(wet).connect(master);
     const fxIn = ctx.createGain();
     fxIn.connect(reverb);
@@ -204,22 +249,23 @@ export class Sound {
     else void this.ctx.resume();
   }
 
-  update(states: Array<VoiceState | null>, events: SoundEvent[]): void {
+  update(states: Array<VoiceState | null>, events: SoundEvent[], timeScale: number): void {
     const ctx = this.ctx;
     if (!ctx || this.muted) return;
     const t = ctx.currentTime;
     for (let i = 0; i < this.voices.length; i++) {
       const s = states[i];
       if (s) this.voices[i].set({ ...s, level: s.level * this.level }, t);
-      else this.voices[i].set({ pan: 0, shares: [], vitality: 0, hunters: 0, resource: 0, motion: 0, level: 0 }, t);
+      else this.voices[i].set({ pan: 0, shares: [], activity: 0, inhibition: 0, stability: 0, pink: 0, density: 0, level: 0 }, t);
     }
-    // At most ~7 events a second, so a thousand worlds become rain, not noise.
+    // A budget of about ten transients a second, so hundreds of minds become rain, not noise.
     const dt = Math.min(0.25, Math.max(0, t - this.lastT));
     this.lastT = t;
-    this.budget = Math.min(3, this.budget + dt * 7);
+    this.budget = Math.min(3, this.budget + dt * (4 + 6 * Math.min(1, timeScale)));
     for (const e of events) {
-      if (this.budget < 1) break;
-      this.budget -= 1;
+      const cost = e.type === 'spike' || e.type === 'pinkspike' ? 1 : 0.5;
+      if (this.budget < cost) continue;
+      this.budget -= cost;
       this.play(e, t + Math.random() * 0.03);
     }
   }
@@ -232,65 +278,71 @@ export class Sound {
     const g = ctx.createGain();
     g.connect(pan);
     const gain = e.gain * this.level;
-    if (e.type === 'birth') {
-      const f = BELL_SCALE[e.lineage % BELL_SCALE.length] * (e.lineage >= 6 ? 0.5 : 1);
-      const o = ctx.createOscillator();
-      o.type = 'sine';
-      o.frequency.value = f;
+    const o = ctx.createOscillator();
+    o.type = 'sine';
+    o.connect(g);
+    g.gain.setValueAtTime(0, t);
+    if (e.type === 'spike') {
+      o.frequency.value = TICK[e.voice % TICK.length];
+      g.gain.linearRampToValueAtTime(0.012 * gain, t + 0.004);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
+      o.start(t);
+      o.stop(t + 0.1);
+    } else if (e.type === 'pinkspike') {
+      o.frequency.value = TICK[e.voice % TICK.length] * 2.76;
       const o2 = ctx.createOscillator();
       o2.type = 'sine';
-      o2.frequency.value = f * 2.76;
-      const g2 = ctx.createGain();
-      g2.gain.value = 0.18;
-      o.connect(g);
-      o2.connect(g2).connect(g);
-      g.gain.setValueAtTime(0, t);
-      g.gain.linearRampToValueAtTime(0.035 * gain, t + 0.012);
-      g.gain.exponentialRampToValueAtTime(0.0001, t + 1.6);
+      o2.frequency.value = TICK[e.voice % TICK.length] * 4.07;
+      o2.connect(g);
+      g.gain.linearRampToValueAtTime(0.01 * gain, t + 0.003);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
       o.start(t);
       o2.start(t);
-      o.stop(t + 1.7);
-      o2.stop(t + 1.7);
-    } else if (e.type === 'catch') {
-      const o = ctx.createOscillator();
-      o.type = 'sine';
-      o.frequency.setValueAtTime(180, t);
-      o.frequency.exponentialRampToValueAtTime(60, t + 0.18);
-      o.connect(g);
-      g.gain.setValueAtTime(0, t);
-      g.gain.linearRampToValueAtTime(0.07 * gain, t + 0.005);
-      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.3);
+      o.stop(t + 0.4);
+      o2.stop(t + 0.4);
+    } else if (e.type === 'settle') {
+      o.frequency.value = CHORD[e.voice % CHORD.length] * 2;
+      const o2 = ctx.createOscillator();
+      o2.type = 'sine';
+      o2.frequency.value = CHORD[e.voice % CHORD.length] * 3;
+      const g2 = ctx.createGain();
+      g2.gain.value = 0.4;
+      o2.connect(g2).connect(g);
+      g.gain.linearRampToValueAtTime(0.03 * gain, t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 2.6);
       o.start(t);
-      o.stop(t + 0.32);
+      o2.start(t);
+      o.stop(t + 2.7);
+      o2.stop(t + 2.7);
     } else {
-      const o = ctx.createOscillator();
-      o.type = 'triangle';
-      o.frequency.setValueAtTime(CHORD[e.lineage % CHORD.length] * 2, t);
-      o.frequency.exponentialRampToValueAtTime(CHORD[e.lineage % CHORD.length], t + 0.9);
-      o.connect(g);
-      g.gain.setValueAtTime(0, t);
-      g.gain.linearRampToValueAtTime(0.012 * gain, t + 0.04);
-      g.gain.exponentialRampToValueAtTime(0.0001, t + 1.0);
-      o.start(t);
-      o.stop(t + 1.05);
+      this.chime(t, 2.2, 0.03 * gain, pan);
+      o.disconnect();
     }
   }
 
-  /** One sustained tone for the ending. */
-  tone(lineage: number, seconds: number): void {
+  /** The glassy pink chime of a postponed spike. */
+  private chime(t: number, seconds: number, peak: number, dest: AudioNode): void {
+    const ctx = this.ctx!;
+    const g = ctx.createGain();
+    g.connect(dest);
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(peak, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + seconds);
+    for (const f of [1864.7, 2489.0, 3520.0 * 1.01]) {
+      const o = ctx.createOscillator();
+      o.type = 'sine';
+      o.frequency.value = f;
+      o.connect(g);
+      o.start(t);
+      o.stop(t + seconds + 0.05);
+    }
+  }
+
+  /** The single sustained pink tone of the ending. */
+  release(_voice: number, seconds: number): void {
     const ctx = this.ctx;
     if (!ctx || this.muted) return;
-    const t = ctx.currentTime;
-    const o = ctx.createOscillator();
-    o.type = 'sine';
-    o.frequency.value = BELL_SCALE[lineage % BELL_SCALE.length];
-    const g = ctx.createGain();
-    o.connect(g).connect(this.fxIn!);
-    g.gain.setValueAtTime(0, t);
-    g.gain.linearRampToValueAtTime(0.04, t + 0.8);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + seconds);
-    o.start(t);
-    o.stop(t + seconds + 0.1);
+    this.chime(ctx.currentTime, seconds, 0.035, this.fxIn!);
   }
 }
 
